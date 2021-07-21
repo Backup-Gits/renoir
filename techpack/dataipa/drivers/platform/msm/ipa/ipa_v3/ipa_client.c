@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2012-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012-2020, The Linux Foundation. All rights reserved.
  */
 
 #include <asm/barrier.h>
@@ -8,7 +8,7 @@
 #include <linux/device.h>
 #include "ipa_i.h"
 #include <linux/msm_gsi.h>
-#include "gsi.h"
+#include "../../gsi/gsi.h"
 
 /*
  * These values were determined empirically and shows good E2E bi-
@@ -62,19 +62,11 @@ int ipa3_enable_data_path(u32 clnt_hdl)
 		 * on other end from IPA hw.
 		 */
 		if ((ep->client == IPA_CLIENT_USB_DPL_CONS) ||
-				(ep->client == IPA_CLIENT_MHI_DPL_CONS)) {
-			holb_cfg.tmr_val = 0;
+				(ep->client == IPA_CLIENT_MHI_DPL_CONS))
 			holb_cfg.en = IPA_HOLB_TMR_EN;
-		} else if (ipa3_ctx->ipa_hw_type == IPA_HW_v4_11 &&
-				(ep->client == IPA_CLIENT_WLAN1_CONS ||
-				 ep->client == IPA_CLIENT_USB_CONS)) {
-			holb_cfg.en = IPA_HOLB_TMR_EN;
-			holb_cfg.tmr_val = IPA_HOLB_TMR_VAL_4_5;
-		}
-		else {
+		else
 			holb_cfg.en = IPA_HOLB_TMR_DIS;
-			holb_cfg.tmr_val = 0;
-		}
+		holb_cfg.tmr_val = 0;
 		res = ipa3_cfg_ep_holb(clnt_hdl, &holb_cfg);
 	}
 
@@ -1184,29 +1176,6 @@ static int ipa3_xdci_stop_gsi_ch_brute_force(u32 clnt_hdl,
 	}
 }
 
-int ipa3_remove_secondary_flow_ctrl(int gsi_chan_hdl)
-{
-	int code = 0;
-	int result;
-
-	result = gsi_query_flow_control_state_ee(gsi_chan_hdl, 0, 1, &code);
-	if (result == GSI_STATUS_SUCCESS) {
-		code = 0;
-		result = gsi_flow_control_ee(gsi_chan_hdl, 0, false, true,
-							&code);
-		if (result == GSI_STATUS_SUCCESS) {
-			IPADBG("flow control sussess ch %d code %d\n",
-					gsi_chan_hdl, code);
-		} else {
-			IPADBG("failed to flow control ch %d code %d\n",
-					gsi_chan_hdl, code);
-		}
-	} else {
-		IPADBG("failed to query flow control mode ch %d code %d\n",
-					gsi_chan_hdl, code);
-	}
-	return result;
-}
 /* Clocks should be voted for before invoking this function */
 static int ipa3_stop_ul_chan_with_data_drain(u32 qmi_req_id,
 		u32 source_pipe_bitmask, bool should_force_clear, u32 clnt_hdl,
@@ -1279,7 +1248,7 @@ static int ipa3_stop_ul_chan_with_data_drain(u32 qmi_req_id,
 			goto exit;
 	}
 	/* if still stop_in_proc or not empty, activate force clear */
-	if (should_force_clear && IPA_CLIENT_IS_PROD(ep->client)) {
+	if (should_force_clear) {
 		result = ipa3_enable_force_clear(qmi_req_id, false,
 			source_pipe_bitmask);
 		if (result) {
@@ -1292,15 +1261,10 @@ static int ipa3_stop_ul_chan_with_data_drain(u32 qmi_req_id,
 			IPAERR(
 				"failed to force clear %d, remove delay from SCND reg\n"
 				, result);
-			if (ipa3_ctx->ipa_endp_delay_wa_v2) {
-				ipa3_remove_secondary_flow_ctrl(
-						ep->gsi_chan_hdl);
-			} else {
-				ep_ctrl_scnd.endp_delay = false;
-				ipahal_write_reg_n_fields(
-					IPA_ENDP_INIT_CTRL_SCND_n, clnt_hdl,
-					&ep_ctrl_scnd);
-			}
+			ep_ctrl_scnd.endp_delay = false;
+			ipahal_write_reg_n_fields(
+				IPA_ENDP_INIT_CTRL_SCND_n, clnt_hdl,
+				&ep_ctrl_scnd);
 		}
 	}
 	/* with force clear, wait for emptiness */
@@ -1449,7 +1413,7 @@ int ipa3_start_stop_client_prod_gsi_chnl(enum ipa_client_type client,
 	client_lock_unlock_cb(client, false);
 	return result;
 }
-int ipa3_set_reset_client_cons_pipe_sus_holb(bool set_reset, u32 tmr_val,
+int ipa3_set_reset_client_cons_pipe_sus_holb(bool set_reset,
 		enum ipa_client_type client)
 {
 	int pipe_idx;
@@ -1461,7 +1425,7 @@ int ipa3_set_reset_client_cons_pipe_sus_holb(bool set_reset, u32 tmr_val,
 	memset(&ep_holb, 0, sizeof(ep_holb));
 
 	ep_suspend.ipa_ep_suspend = set_reset;
-	ep_holb.tmr_val = tmr_val;
+	ep_holb.tmr_val = 0;
 	ep_holb.en = set_reset;
 
 	if (IPA_CLIENT_IS_PROD(client)) {
@@ -1568,6 +1532,8 @@ int ipa3_xdci_disconnect(u32 clnt_hdl, bool should_force_clear, u32 qmi_req_id)
 	if (!ep->keep_ipa_awake)
 		IPA_ACTIVE_CLIENTS_INC_EP(ipa3_get_client_mapping(clnt_hdl));
 
+	ipa3_disable_data_path(clnt_hdl);
+
 	if (!IPA_CLIENT_IS_CONS(ep->client)) {
 		IPADBG("Stopping PROD channel - hdl=%d clnt=%d\n",
 			clnt_hdl, ep->client);
@@ -1591,7 +1557,6 @@ int ipa3_xdci_disconnect(u32 clnt_hdl, bool should_force_clear, u32 qmi_req_id)
 			goto stop_chan_fail;
 		}
 	}
-	ipa3_disable_data_path(clnt_hdl);
 	IPA_ACTIVE_CLIENTS_DEC_EP(ipa3_get_client_mapping(clnt_hdl));
 
 	IPADBG("exit\n");

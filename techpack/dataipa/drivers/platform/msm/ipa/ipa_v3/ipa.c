@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2012-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012-2020, The Linux Foundation. All rights reserved.
  */
 
 #include <linux/clk.h>
@@ -34,7 +34,7 @@
 #include <linux/soc/qcom/smem_state.h>
 #include <linux/of_irq.h>
 #include <linux/ctype.h>
-#include "gsi.h"
+#include "../../gsi/gsi.h"
 #include <linux/sched.h>
 #include <asm/arch_timer.h>
 #include <linux/sched/clock.h>
@@ -131,8 +131,6 @@ static void ipa_dec_clients_disable_clks_on_wq(struct work_struct *work);
 static DECLARE_DELAYED_WORK(ipa_dec_clients_disable_clks_on_wq_work,
 	ipa_dec_clients_disable_clks_on_wq);
 
-static DECLARE_DELAYED_WORK(ipa_dec_clients_disable_clks_on_suspend_irq_wq_work,
-	ipa_dec_clients_disable_clks_on_wq);
 static void ipa_inc_clients_enable_clks_on_wq(struct work_struct *work);
 static DECLARE_WORK(ipa_inc_clients_enable_clks_on_wq_work,
 	ipa_inc_clients_enable_clks_on_wq);
@@ -154,7 +152,6 @@ static struct clk *ipa3_clk;
 
 struct ipa3_context *ipa3_ctx = NULL;
 
-void ipa3_plat_drv_shutdown(struct platform_device *pdev_p);
 int ipa3_plat_drv_probe(struct platform_device *pdev_p);
 int ipa3_pci_drv_probe(
 	struct pci_dev            *pci_dev,
@@ -444,7 +441,6 @@ static const struct dev_pm_ops ipa_pm_ops = {
 
 static struct platform_driver ipa_plat_drv = {
 	.probe = ipa3_plat_drv_probe,
-	.shutdown = ipa3_plat_drv_shutdown,
 	.driver = {
 		.name = DRV_NAME,
 		.pm = &ipa_pm_ops,
@@ -1868,7 +1864,6 @@ static long ipa3_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	size_t sz;
 	int pre_entry;
 	int hdl;
-	u32 hw_feature_support = 0;
 
 	IPADBG("cmd=%x nr=%d\n", cmd, _IOC_NR(cmd));
 
@@ -3083,24 +3078,7 @@ static long ipa3_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		retval = ipa3_app_clk_vote(
 			(enum ipa_app_clock_vote_type) arg);
 		break;
-	case IPA_IOC_GET_HW_FEATURE_SUPPORT:
-		pyld_sz = sizeof(u32);
-		/*Add new HW feature support to sent to userspace*/
-		hw_feature_support |= (ipa3_ctx->is_eth_bridging_supported <<
-					ETH_BRIDGING_SUPPORT);
 
-		param = kmemdup(&hw_feature_support, pyld_sz,
-					GFP_KERNEL);
-		if (!param) {
-			retval = -ENOMEM;
-			break;
-		}
-		if (copy_to_user((void __user *)arg, param, pyld_sz)) {
-			retval = -EFAULT;
-			break;
-		}
-
-		break;
 	default:
 		IPA_ACTIVE_CLIENTS_DEC_SIMPLE();
 		return -ENOTTY;
@@ -3334,40 +3312,6 @@ static void ipa3_destroy_imm(void *user1, int user2)
 	ipahal_destroy_imm_cmd(user1);
 }
 
-static void ipa3_q6_pipe_flow_control(bool delay)
-{
-	int ep_idx;
-	int client_idx;
-	int code = 0, result;
-	const struct ipa_gsi_ep_config *gsi_ep_cfg;
-
-	for (client_idx = 0; client_idx < IPA_CLIENT_MAX; client_idx++) {
-		if (IPA_CLIENT_IS_Q6_PROD(client_idx)) {
-			ep_idx = ipa3_get_ep_mapping(client_idx);
-			if (ep_idx == -1)
-				continue;
-			gsi_ep_cfg = ipa3_get_gsi_ep_info(client_idx);
-			if (!gsi_ep_cfg) {
-				IPAERR("failed to get GSI config\n");
-				ipa_assert();
-				return;
-			}
-			IPADBG("pipe setting V2 flow control\n");
-			/* Configurig primary flow control on Q6 pipes*/
-			result = gsi_flow_control_ee(
-					gsi_ep_cfg->ipa_gsi_chan_num,
-					gsi_ep_cfg->ee, delay, false, &code);
-			if (result == GSI_STATUS_SUCCESS) {
-				IPADBG("sussess gsi ch %d with code %d\n",
-					gsi_ep_cfg->ipa_gsi_chan_num, code);
-			} else {
-				IPADBG("failed  gsi ch %d code %d\n",
-					gsi_ep_cfg->ipa_gsi_chan_num, code);
-			}
-		}
-	}
-}
-
 static void ipa3_q6_pipe_delay(bool delay)
 {
 	int client_idx;
@@ -3480,18 +3424,16 @@ static void ipa3_halt_q6_gsi_channels(bool prod)
 					gsi_ep_cfg->ipa_gsi_chan_num,
 					gsi_ep_cfg->ee, &code);
 			}
-			if (ret == GSI_STATUS_SUCCESS) {
+			if (ret == GSI_STATUS_SUCCESS)
 				IPADBG("halted gsi ch %d ee %d with code %d\n",
 				gsi_ep_cfg->ipa_gsi_chan_num,
 				gsi_ep_cfg->ee,
 				code);
-			} else {
+			else
 				IPAERR("failed to halt ch %d ee %d code %d\n",
 				gsi_ep_cfg->ipa_gsi_chan_num,
 				gsi_ep_cfg->ee,
 				code);
-				ipa_assert();
-			}
 		}
 	}
 }
@@ -4045,24 +3987,15 @@ void ipa3_q6_pre_shutdown_cleanup(void)
 	IPA_ACTIVE_CLIENTS_INC_SIMPLE();
 
 	ipa3_update_ssr_state(true);
-
-	if (ipa3_ctx->ipa_endp_delay_wa_v2)
-		ipa3_q6_pipe_flow_control(true);
-	else if (!ipa3_ctx->ipa_endp_delay_wa)
+	if (!ipa3_ctx->ipa_endp_delay_wa)
 		ipa3_q6_pipe_delay(true);
-
 	ipa3_q6_avoid_holb();
-
-	if (ipa3_ctx->ipa_hw_type == IPA_HW_v4_11)
-		ipa3_set_reset_client_cons_pipe_sus_holb(true, 0,
-		IPA_CLIENT_USB_CONS);
-
 	if (ipa3_ctx->ipa_hw_type >= IPA_HW_v4_0) {
 		prod = true;
 		ipa3_halt_q6_gsi_channels(prod);
 	}
 	if (ipa3_ctx->ipa_config_is_mhi)
-		ipa3_set_reset_client_cons_pipe_sus_holb(true, 0,
+		ipa3_set_reset_client_cons_pipe_sus_holb(true,
 		IPA_CLIENT_MHI_CONS);
 	if (ipa3_q6_clean_q6_tables()) {
 		IPAERR("Failed to clean Q6 tables\n");
@@ -4083,11 +4016,7 @@ void ipa3_q6_pre_shutdown_cleanup(void)
 	/* Remove delay from Q6 PRODs to avoid pending descriptors
 	 * on pipe reset procedure
 	 */
-	if (ipa3_ctx->ipa_endp_delay_wa_v2) {
-		ipa3_q6_pipe_flow_control(false);
-		ipa3_set_reset_client_prod_pipe_delay(true,
-			IPA_CLIENT_USB_PROD);
-	} else if (!ipa3_ctx->ipa_endp_delay_wa) {
+	if (!ipa3_ctx->ipa_endp_delay_wa) {
 		ipa3_q6_pipe_delay(false);
 		ipa3_set_reset_client_prod_pipe_delay(true,
 			IPA_CLIENT_USB_PROD);
@@ -4120,9 +4049,6 @@ void ipa3_q6_post_shutdown_cleanup(void)
 	/* Handle the issue where SUSPEND was removed for some reason */
 	ipa3_q6_avoid_holb();
 
-	if (ipa3_ctx->ipa_hw_type == IPA_HW_v4_11)
-		ipa3_set_reset_client_cons_pipe_sus_holb(true,
-		IPA_HOLB_TMR_VAL_4_5, IPA_CLIENT_USB_CONS);
 	/* halt both prod and cons channels starting at IPAv4 */
 	if (ipa3_ctx->ipa_hw_type >= IPA_HW_v4_0) {
 		IPA_ACTIVE_CLIENTS_DEC_SIMPLE();
@@ -5604,22 +5530,6 @@ void ipa3_dec_client_disable_clks_no_block(
 }
 
 /**
- * ipa3_dec_client_disable_clks_delay_wq() - Decrease active clients counter
- * in delayed workqueue.
- *
- * Return codes:
- * None
- */
-void ipa3_dec_client_disable_clks_delay_wq(
-	struct ipa_active_client_logging_info *id, unsigned long delay)
-{
-	ipa3_active_clients_log_dec(id, true);
-
-	if (!queue_delayed_work(ipa3_ctx->power_mgmt_wq,
-		&ipa_dec_clients_disable_clks_on_suspend_irq_wq_work, delay))
-		IPAERR("Scheduling delayed work failed\n");
-}
-/**
  * ipa3_inc_acquire_wakelock() - Increase active clients counter, and
  * acquire wakelock if necessary
  *
@@ -6023,7 +5933,6 @@ static int ipa3_panic_notifier(struct notifier_block *this,
 	unsigned long event, void *ptr)
 {
 	int res;
-	struct ipa_active_client_logging_info log_info;
 
 	ipa3_freeze_clock_vote_and_notify_modem();
 
@@ -6032,12 +5941,7 @@ static int ipa3_panic_notifier(struct notifier_block *this,
 	if (res)
 		IPAERR("uC panic handler failed %d\n", res);
 
-	/* Make sure IPA clock voted when collecting the reg dump */
-	IPA_ACTIVE_CLIENTS_PREP_SPECIAL(log_info, "PANIC_VOTE");
-	res = ipa3_inc_client_enable_clks_no_block(&log_info);
-	if (res) {
-		IPAERR("IPA clk off not saving the IPA registers\n");
-	} else {
+	if (atomic_read(&ipa3_ctx->ipa_clk_vote)) {
 		ipahal_print_all_regs(false);
 		ipa_save_registers();
 		ipa_wigig_save_regs();
@@ -6550,8 +6454,6 @@ fail_teth_bridge_driver_init:
 	ipa3_teardown_apps_pipes();
 fail_alloc_gsi_channel:
 fail_setup_apps_pipes:
-	ipahal_print_all_regs(false);
-	ipa_save_registers();
 	gsi_deregister_device(ipa3_ctx->gsi_dev_hdl, false);
 fail_register_device:
 	ipa3_destroy_flt_tbl_idrs();
@@ -7150,7 +7052,6 @@ static int ipa3_pre_init(const struct ipa3_plat_drv_res *resource_p,
 	ipa3_ctx->manual_fw_load = resource_p->manual_fw_load;
 	ipa3_ctx->max_num_smmu_cb = resource_p->max_num_smmu_cb;
 	ipa3_ctx->hw_type_index = ipa3_get_hw_type_index();
-	ipa3_ctx->fnr_stats_not_supported = resource_p->fnr_stats_not_supported;
 
 	if (resource_p->gsi_fw_file_name) {
 		ipa3_ctx->gsi_fw_file_name =
@@ -7202,10 +7103,6 @@ static int ipa3_pre_init(const struct ipa3_plat_drv_res *resource_p,
 		ipa3_ctx->do_testbus_collection_on_crash = false;
 	}
 	ipa3_ctx->ipa_endp_delay_wa = resource_p->ipa_endp_delay_wa;
-	ipa3_ctx->ipa_endp_delay_wa_v2 = resource_p->ipa_endp_delay_wa_v2;
-	ipa3_ctx->is_eth_bridging_supported =
-			resource_p->is_eth_bridging_supported;
-	ipa3_ctx->is_bw_monitor_supported = resource_p->is_bw_monitor_supported;
 
 	WARN(ipa3_ctx->ipa3_hw_mode != IPA_HW_MODE_NORMAL,
 		"Non NORMAL IPA HW mode, is this emulation platform ?");
@@ -7584,8 +7481,6 @@ static int ipa3_pre_init(const struct ipa3_plat_drv_res *resource_p,
 		}
 	}
 
-	ipa3_ctx->modem_load_ipa_fw = resource_p->modem_load_ipa_fw;
-
 	cdev = &ipa3_ctx->cdev.cdev;
 	cdev_init(cdev, &ipa3_drv_fops);
 	cdev->owner = THIS_MODULE;
@@ -7630,14 +7525,11 @@ static int ipa3_pre_init(const struct ipa3_plat_drv_res *resource_p,
 			goto fail_wwan_init;
 		}
 
-		if (ipa3_ctx->rmnet_ctl_enable) {
-			result = ipa3_rmnet_ctl_init();
-			if (result) {
-				IPAERR(":ipa3_rmnet_ctl_init err=%d\n",
-					-result);
-				result = -ENODEV;
-				goto fail_rmnet_ctl_init;
-			}
+		result = ipa3_rmnet_ctl_init();
+		if (result) {
+			IPAERR(":ipa3_rmnet_ctl_init err=%d\n", -result);
+			result = -ENODEV;
+			goto fail_rmnet_ctl_init;
 		}
 	}
 	mutex_init(&ipa3_ctx->app_clock_vote.mutex);
@@ -7958,11 +7850,6 @@ static int get_ipa_dts_configuration(struct platform_device *pdev,
 	ipa_drv_res->ipa_config_is_auto = false;
 	ipa_drv_res->manual_fw_load = false;
 	ipa_drv_res->max_num_smmu_cb = IPA_SMMU_CB_MAX;
-	ipa_drv_res->ipa_endp_delay_wa_v2 = false;
-	ipa_drv_res->is_eth_bridging_supported = false;
-	ipa_drv_res->is_bw_monitor_supported = false;
-	ipa_drv_res->modem_load_ipa_fw = false;
-	ipa_drv_res->fnr_stats_not_supported = false;
 
 	/* Get IPA HW Version */
 	result = of_property_read_u32(pdev->dev.of_node, "qcom,ipa-hw-ver",
@@ -8053,31 +7940,6 @@ static int get_ipa_dts_configuration(struct platform_device *pdev,
 			"qcom,ipa-endp-delay-wa");
 	IPADBG(": endppoint delay wa = %s\n",
 			ipa_drv_res->ipa_endp_delay_wa
-			? "True" : "False");
-
-	ipa_drv_res->ipa_endp_delay_wa_v2 =
-			of_property_read_bool(pdev->dev.of_node,
-			"qcom,ipa-endp-delay-wa-v2");
-	IPADBG(": endppoint delay wa v2 = %s\n",
-			ipa_drv_res->ipa_endp_delay_wa_v2
-			? "True" : "False");
-
-	if (of_property_read_bool(pdev->dev.of_node,
-			"qcom,eth-bridging-not-supported"))
-		ipa_drv_res->is_eth_bridging_supported = false;
-	else
-		ipa_drv_res->is_eth_bridging_supported = true;
-
-	IPADBG(": ETH bridging supported = %s\n",
-			ipa_drv_res->is_eth_bridging_supported
-			? "True" : "False");
-
-	ipa_drv_res->is_bw_monitor_supported =
-		of_property_read_bool(pdev->dev.of_node,
-			"qcom,bw-monitor-supported");
-
-	IPADBG(": BW Monitor and QUOTA stats supported = %s\n",
-			ipa_drv_res->is_bw_monitor_supported
 			? "True" : "False");
 
 	ipa_drv_res->ipa_wdi3_over_gsi =
@@ -8250,20 +8112,6 @@ static int get_ipa_dts_configuration(struct platform_device *pdev,
 		IPADBG(": gsi wdi db polling = %s\n",
 				ipa_drv_res->gsi_wdi_db_polling
 				? "True" : "False");
-	ipa_drv_res->modem_load_ipa_fw =
-		of_property_read_bool(pdev->dev.of_node,
-		"qcom,modem-load-ipa-fw");
-	IPADBG(": Load IPA_FW by modem = %s\n",
-		ipa_drv_res->modem_load_ipa_fw
-		? "True" : "False");
-
-	ipa_drv_res->fnr_stats_not_supported =
-		of_property_read_bool(pdev->dev.of_node,
-		"qcom,fnr-stats-not-supported");
-	IPADBG(": FnR stats not supported = %s\n",
-		ipa_drv_res->fnr_stats_not_supported
-		? "True" : "False");
-
 	result = of_property_read_string(pdev->dev.of_node,
 			"qcom,use-gsi-ipa-fw", &ipa_drv_res->gsi_fw_file_name);
 	if (!result)
@@ -8992,27 +8840,6 @@ static int ipa3_attach_to_smmu(void)
 	return 0;
 }
 
-static irqreturn_t ipa_smp2p_modem_fw_load_ready_isr(int irq, void *ctxt)
-{
-	int result;
-
-	if (!ipa3_ctx->smp2p_info.disabled) {
-		result = ipa3_attach_to_smmu();
-		if (result) {
-			IPAERR("IPA attach to smmu failed %d\n", result);
-			goto bail;
-		}
-		result = ipa3_post_init(&ipa3_res, ipa3_ctx->cdev.dev);
-		if (result) {
-			IPAERR("IPA post init failed %d\n", result);
-			goto bail;
-		}
-		ipa3_ctx->smp2p_info.disabled = true;
-	}
-
-bail:
-	return IRQ_HANDLED;
-}
 static irqreturn_t ipa3_smp2p_modem_clk_query_isr(int irq, void *ctxt)
 {
 	ipa3_freeze_clock_vote_and_notify_modem();
@@ -9065,23 +8892,6 @@ static int ipa3_smp2p_probe(struct device *dev)
 			IPAERR("fail to register smp2p irq=%d\n", irq);
 			return -ENODEV;
 		}
-
-		if (ipa3_ctx->modem_load_ipa_fw) {
-			res = irq = of_irq_get_byname(node, "ipa-fw-load-ready");
-			if (res < 0) {
-				IPADBG("of_irq_get_byname returned %d\n", irq);
-				return res;
-			}
-
-			res = devm_request_threaded_irq(dev, irq, NULL,
-				(irq_handler_t)ipa_smp2p_modem_fw_load_ready_isr,
-				IRQF_TRIGGER_RISING | IRQF_ONESHOT,
-				"ipa_fw_load_ready", dev);
-			if (res) {
-				IPAERR("fail to register smp2p irq=%d\n", irq);
-				return -ENODEV;
-			}
-		}
 	}
 	return 0;
 }
@@ -9106,30 +8916,6 @@ static void ipa_smmu_update_fw_loader(void)
 	} else {
 		IPADBG("smmu is disabled\n");
 	}
-}
-
-void ipa3_plat_drv_shutdown(struct platform_device *pdev_p)
-{
-	int res;
-	struct ipa_active_client_logging_info log_info;
-
-	pr_debug("ipa: driver shutdown invoked for %s\n",
-		pdev_p->dev.of_node->name);
-	if(unlikely(!ipa3_ctx))
-	{
-		IPAERR("IPA driver not initialized\n");
-		return;
-	}
-	/* Make sure IPA clock voted when collecting the reg dump */
-	IPA_ACTIVE_CLIENTS_PREP_SPECIAL(log_info, "SHUTDOWN_VOTE");
-	res = ipa3_inc_client_enable_clks_no_block(&log_info);
-	if (res) {
-		IPAERR("IPA clk off not saving the IPA registers\n");
-	} else {
-		ipahal_print_all_regs(false);
-		ipa_save_registers();
-	}
-	return;
 }
 
 int ipa3_plat_drv_probe(struct platform_device *pdev_p)

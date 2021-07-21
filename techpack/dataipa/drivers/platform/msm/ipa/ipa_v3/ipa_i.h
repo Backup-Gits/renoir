@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * Copyright (c) 2012-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012-2020, The Linux Foundation. All rights reserved.
  */
 
 #ifndef _IPA3_I_H_
@@ -453,8 +453,6 @@ enum {
 #define IPA_TZ_UNLOCK_ATTRIBUTE 0x0C0311
 
 #define MBOX_TOUT_MS 100
-
-#define IPA_RULE_CNT_MAX 512
 
 /* miscellaneous for rmnet_ipa and qmi_service */
 enum ipa_type_mode {
@@ -1704,7 +1702,6 @@ struct ipa3_smp2p_info {
 	u32 in_base_id;
 	bool ipa_clk_on;
 	bool res_sent;
-	bool disabled;
 	unsigned int smem_bit;
 	struct qcom_smem_state *smem_state;
 };
@@ -1952,8 +1949,6 @@ struct ipa3_app_clock_vote {
  * @manual_fw_load: bool,if fw load is done manually
  * @max_num_smmu_cb: number of smmu s1 cb supported
  * @ipa_config_is_auto: flag to indicate auto config 
- * @is_eth_bridging_supported: Flag to check eth bridging supported or not
- * @is_bw_monitor_supported: Flag to check BW monitor supported or not.
  */
 struct ipa3_context {
 	struct ipa3_char_device_context cdev;
@@ -2149,11 +2144,6 @@ struct ipa3_context {
 	bool manual_fw_load;
 	u32 num_smmu_cb_probed;
 	u32 max_num_smmu_cb;
-	bool ipa_endp_delay_wa_v2;
-	bool is_eth_bridging_supported;
-	bool is_bw_monitor_supported;
-	bool modem_load_ipa_fw;
-	bool fnr_stats_not_supported;
 };
 
 struct ipa3_plat_drv_res {
@@ -2222,11 +2212,6 @@ struct ipa3_plat_drv_res {
 	bool manual_fw_load;
 	bool ipa_config_is_auto;
 	u32 max_num_smmu_cb;
-	bool ipa_endp_delay_wa_v2;
-	bool is_eth_bridging_supported;
-	bool is_bw_monitor_supported;
-	bool modem_load_ipa_fw;
-	bool fnr_stats_not_supported;
 };
 
 /**
@@ -2503,7 +2488,7 @@ int ipa3_start_stop_client_prod_gsi_chnl(enum ipa_client_type client,
 void ipa3_client_prod_post_shutdown_cleanup(void);
 
 
-int ipa3_set_reset_client_cons_pipe_sus_holb(bool set_reset, u32 tmr_val,
+int ipa3_set_reset_client_cons_pipe_sus_holb(bool set_reset,
 		enum ipa_client_type client);
 
 int ipa3_xdci_suspend(u32 ul_clnt_hdl, u32 dl_clnt_hdl,
@@ -2865,8 +2850,6 @@ int ipa3_inc_client_enable_clks_no_block(struct ipa_active_client_logging_info
 		*id);
 void ipa3_dec_client_disable_clks_no_block(
 	struct ipa_active_client_logging_info *id);
-void ipa3_dec_client_disable_clks_delay_wq(
-		struct ipa_active_client_logging_info *id, unsigned long delay);
 void ipa3_active_clients_log_dec(struct ipa_active_client_logging_info *id,
 		bool int_ctx);
 void ipa3_active_clients_log_inc(struct ipa_active_client_logging_info *id,
@@ -2921,7 +2904,6 @@ void ipa3_skb_recycle(struct sk_buff *skb);
 void ipa3_install_dflt_flt_rules(u32 ipa_ep_idx);
 void ipa3_delete_dflt_flt_rules(u32 ipa_ep_idx);
 
-int ipa3_remove_secondary_flow_ctrl(int gsi_chan_hdl);
 int ipa3_enable_data_path(u32 clnt_hdl);
 int ipa3_disable_data_path(u32 clnt_hdl);
 int ipa3_disable_gsi_data_path(u32 clnt_hdl);

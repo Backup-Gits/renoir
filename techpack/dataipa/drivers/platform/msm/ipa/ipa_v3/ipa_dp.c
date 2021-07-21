@@ -1,7 +1,7 @@
 
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2012-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012-2020, The Linux Foundation. All rights reserved.
  */
 
 #include <linux/delay.h>
@@ -11,7 +11,7 @@
 #include <linux/netdevice.h>
 #include <linux/msm_gsi.h>
 #include <net/sock.h>
-#include "gsi.h"
+#include "../../gsi/gsi.h"
 #include "ipa_i.h"
 #include "ipa_trace.h"
 #include "ipahal.h"
@@ -430,12 +430,6 @@ int ipa3_send(struct ipa3_sys_context *sys,
 	memset(gsi_xfer, 0, sizeof(gsi_xfer[0]) * num_desc);
 
 	spin_lock_bh(&sys->spinlock);
-
-	if (unlikely(atomic_read(&sys->ep->disconnect_in_progress))) {
-		IPAERR("Pipe disconnect in progress dropping the packet\n");
-		spin_unlock_bh(&sys->spinlock);
-		return -EFAULT;
-	}
 
 	for (i = 0; i < num_desc; i++) {
 		if (!list_empty(&sys->avail_tx_wrapper_list)) {
@@ -900,7 +894,7 @@ static int ipa3_rx_switch_to_intr_mode(struct ipa3_sys_context *sys)
 
 	atomic_set(&sys->curr_polling_state, 0);
 	__ipa3_update_curr_poll_state(sys->ep->client, 0);
-	ipa_pm_deferred_deactivate(sys->pm_hdl);
+
 	ipa3_dec_release_wakelock();
 	ret = gsi_config_channel_mode(sys->ep->gsi_chan_hdl,
 		GSI_CHAN_MODE_CALLBACK);
@@ -933,8 +927,8 @@ static void ipa3_handle_rx(struct ipa3_sys_context *sys)
 	int cnt;
 	int ret;
 
-start_poll:
 	ipa_pm_activate_sync(sys->pm_hdl);
+start_poll:
 	inactive_cycles = 0;
 	do {
 		cnt = ipa3_handle_rx_core(sys, true, true);
@@ -962,7 +956,7 @@ start_poll:
 	if (ret == -GSI_STATUS_PENDING_IRQ)
 		goto start_poll;
 
-	IPA_ACTIVE_CLIENTS_DEC_EP(sys->ep->client);
+	ipa_pm_deferred_deactivate(sys->pm_hdl);
 }
 
 static void ipa3_switch_to_intr_rx_work_func(struct work_struct *work)
@@ -1451,7 +1445,6 @@ int ipa3_teardown_sys_pipe(u32 clnt_hdl)
 	if (IPA_CLIENT_IS_PROD(ep->client)) {
 		do {
 			spin_lock_bh(&ep->sys->spinlock);
-			atomic_set(&ep->disconnect_in_progress, 1);
 			empty = list_empty(&ep->sys->head_desc_list);
 			spin_unlock_bh(&ep->sys->spinlock);
 			if (!empty)
@@ -1943,23 +1936,15 @@ fail_pipe_not_valid:
 static void ipa3_wq_handle_rx(struct work_struct *work)
 {
 	struct ipa3_sys_context *sys;
-	enum ipa_client_type client_type;
 
 	sys = container_of(work, struct ipa3_sys_context, work);
-	/*
-	 * Mark client as WAN_COAL_CONS only as
-	 * NAPI only use sys of WAN_COAL_CONS.
-	 */
-	if (IPA_CLIENT_IS_WAN_CONS(sys->ep->client))
-		client_type = IPA_CLIENT_APPS_WAN_COAL_CONS;
-	else
-		client_type = sys->ep->client;
 
-	IPA_ACTIVE_CLIENTS_INC_EP(client_type);
 	if (sys->napi_obj) {
+		ipa_pm_activate_sync(sys->pm_hdl);
 		napi_schedule(sys->napi_obj);
 		IPA_STATS_INC_CNT(sys->napi_sch_cnt);
 	} else if (IPA_CLIENT_IS_LOW_LAT_CONS(sys->ep->client)) {
+		ipa_pm_activate_sync(sys->pm_hdl);
 		tasklet_schedule(&sys->tasklet);
 	} else
 		ipa3_handle_rx(sys);
@@ -2499,11 +2484,9 @@ fail_dma_mapping:
 fail_skb_alloc:
 	kmem_cache_free(ipa3_ctx->rx_pkt_wrapper_cache, rx_pkt);
 fail_kmem_cache_alloc:
-	if (rx_len_cached == 0) {
+	if (rx_len_cached == 0)
 		queue_delayed_work(sys->wq, &sys->replenish_rx_work,
 				msecs_to_jiffies(1));
-		return;
-	}
 done:
 	/* only ring doorbell once here */
 	ret = gsi_queue_xfer(sys->ep->gsi_chan_hdl, idx,
@@ -2608,12 +2591,9 @@ fail_dma_mapping:
 	INIT_LIST_HEAD(&rx_pkt->link);
 	spin_unlock_bh(&sys->spinlock);
 fail_kmem_cache_alloc:
-	if (rx_len_cached == 0) {
+	if (rx_len_cached == 0)
 		queue_delayed_work(sys->wq, &sys->replenish_rx_work,
 		msecs_to_jiffies(1));
-		return;
-	}
-
 done:
 	/* only ring doorbell once here */
 	ret = gsi_queue_xfer(sys->ep->gsi_chan_hdl, idx,
@@ -2885,7 +2865,7 @@ static int ipa3_lan_rx_pyld_hdlr(struct sk_buff *skb,
 	unsigned long ptr;
 
 	IPA_DUMP_BUFF(skb->data, 0, skb->len);
-	trace_ipa3_lan_rx_pyld_hdlr_entry(skb,sys->ep->client);
+
 	if (skb->len == 0) {
 		IPAERR("ZLT packet arrived to AP\n");
 		goto out;
@@ -3167,7 +3147,6 @@ begin:
 
 out:
 	ipa3_skb_recycle(skb);
-	trace_ipa3_lan_rx_pyld_hdlr_exit(sys->ep->client);
 	return 0;
 }
 
@@ -3434,7 +3413,6 @@ void ipa3_lan_rx_cb(void *priv, enum ipa_dp_evt_type evt, unsigned long data)
 	void *client_priv;
 
 	ipahal_pkt_status_parse_thin(rx_skb->data, &status);
-	trace_ipa3_lan_rx_cb_entry(status.endp_src_idx);
 	src_pipe = status.endp_src_idx;
 	metadata = status.metadata;
 	ucp = status.ucp;
@@ -3476,7 +3454,6 @@ void ipa3_lan_rx_cb(void *priv, enum ipa_dp_evt_type evt, unsigned long data)
 		dev_kfree_skb_any(rx_skb);
 	}
 
-	trace_ipa3_lan_rx_cb_exit(status.endp_src_idx);
 }
 
 static void ipa3_recycle_rx_wrapper(struct ipa3_rx_pkt_wrapper *rx_pkt)
@@ -4618,29 +4595,18 @@ static void ipa_gsi_irq_tx_notify_cb(struct gsi_chan_xfer_notify *notify)
 
 void __ipa_gsi_irq_rx_scedule_poll(struct ipa3_sys_context *sys)
 {
-	bool clk_off = true;
-	enum ipa_client_type client_type;
+	bool clk_off;
 
 	atomic_set(&sys->curr_polling_state, 1);
 	__ipa3_update_curr_poll_state(sys->ep->client, 1);
 
 	ipa3_inc_acquire_wakelock();
+
 	/*
-	 * Mark client as WAN_COAL_CONS only as
-	 * NAPI only use sys of WAN_COAL_CONS.
+	 * pm deactivate is done in wq context
+	 * or after NAPI poll
 	 */
-	if (IPA_CLIENT_IS_WAN_CONS(sys->ep->client))
-		client_type = IPA_CLIENT_APPS_WAN_COAL_CONS;
-	else
-		client_type = sys->ep->client;
-	/*
-	 * Have race condition to use PM on poll to isr
-	 * switch. Use the active no block instead
-	 * where we would have ref counts.
-	 */
-	if (sys->napi_obj ||
-		IPA_CLIENT_IS_LOW_LAT_CONS(sys->ep->client))
-		clk_off = IPA_ACTIVE_CLIENTS_INC_EP_NO_BLOCK(client_type);
+	clk_off = ipa_pm_activate(sys->pm_hdl);
 	if (!clk_off && sys->napi_obj) {
 		trace_ipa3_napi_schedule(sys->ep->client);
 		napi_schedule(sys->napi_obj);
@@ -5249,14 +5215,8 @@ int ipa3_lan_rx_poll(u32 clnt_hdl, int weight)
 		return cnt;
 	}
 	ep = &ipa3_ctx->ep[clnt_hdl];
-	trace_ipa3_napi_poll_entry(ep->client);
 
 start_poll:
-	/*
-	 * it is guaranteed we already have clock here.
-	 * This is mainly for clock scaling.
-	 */
-	ipa_pm_activate(ep->sys->pm_hdl);
 	while (remain_aggr_weight > 0 &&
 			atomic_read(&ep->sys->curr_polling_state)) {
 		atomic_set(&ipa3_ctx->transport_pm.eot_activity, 1);
@@ -5286,10 +5246,9 @@ start_poll:
 				napi_reschedule(ep->sys->napi_obj))
 			goto start_poll;
 
-		IPA_ACTIVE_CLIENTS_DEC_EP_NO_BLOCK(ep->client);
+		ipa_pm_deferred_deactivate(ep->sys->pm_hdl);
 	}
 
-	trace_ipa3_napi_poll_exit(ep->client, cnt, ep->sys->len);
 	return cnt;
 }
 
@@ -5312,7 +5271,7 @@ int ipa3_rx_poll(u32 clnt_hdl, int weight)
 	int remain_aggr_weight;
 	int ipa_ep_idx;
 	struct ipa_active_client_logging_info log;
-	static struct gsi_chan_xfer_notify notify[IPA_WAN_NAPI_MAX_FRAMES];
+	struct gsi_chan_xfer_notify notify[IPA_WAN_NAPI_MAX_FRAMES];
 
 	IPA_ACTIVE_CLIENTS_PREP_SPECIAL(log, "NAPI");
 
@@ -5343,11 +5302,6 @@ int ipa3_rx_poll(u32 clnt_hdl, int weight)
 	}
 
 start_poll:
-	/*
-	 * it is guaranteed we already have clock here.
-	 * This is mainly for clock scaling.
-	 */
-	ipa_pm_activate(ep->sys->pm_hdl);
 	while (remain_aggr_weight > 0 &&
 			atomic_read(&ep->sys->curr_polling_state)) {
 		atomic_set(&ipa3_ctx->transport_pm.eot_activity, 1);
@@ -5386,13 +5340,13 @@ start_poll:
 		if (ret == -GSI_STATUS_PENDING_IRQ &&
 				napi_reschedule(ep->sys->napi_obj))
 			goto start_poll;
-		IPA_ACTIVE_CLIENTS_DEC_EP_NO_BLOCK(ep->client);
+		ipa_pm_deferred_deactivate(ep->sys->pm_hdl);
 	} else {
 		cnt = weight;
 		IPADBG_LOW("Client = %d not replenished free descripotrs\n",
 				ep->client);
 	}
-	trace_ipa3_napi_poll_exit(ep->client, cnt, ep->sys->len);
+	trace_ipa3_napi_poll_exit(ep->client);
 	return cnt;
 }
 
@@ -5529,11 +5483,6 @@ static void ipa3_tasklet_rx_notify(unsigned long data)
 	sys = (struct ipa3_sys_context *)data;
 	atomic_set(&ipa3_ctx->transport_pm.eot_activity, 1);
 start_poll:
-	/*
-	 * it is guaranteed we already have clock here.
-	 * This is mainly for clock scaling.
-	 */
-	ipa_pm_activate(sys->pm_hdl);
 	while (1) {
 		ret = ipa_poll_gsi_pkt(sys, &notify);
 		if (ret)
@@ -5548,6 +5497,6 @@ start_poll:
 	ret = ipa3_rx_switch_to_intr_mode(sys);
 	if (ret == -GSI_STATUS_PENDING_IRQ)
 		goto start_poll;
-	IPA_ACTIVE_CLIENTS_DEC_EP_NO_BLOCK(sys->ep->client);
+	ipa_pm_deferred_deactivate(sys->pm_hdl);
 }
 
